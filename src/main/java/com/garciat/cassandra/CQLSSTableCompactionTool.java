@@ -94,12 +94,12 @@ public class CQLSSTableCompactionTool {
             throw new ToolException("Could not create path: " + keyspacePath);
         }
 
-        Path outputPath = keyspacePath.resolve(options.tableName);
+        Path tableStorageDir = keyspacePath.resolve(options.tableName);
 
         try {
-            java.nio.file.Files.createSymbolicLink(outputPath, options.inputDir.toPath());
+            java.nio.file.Files.createSymbolicLink(tableStorageDir, options.inputDir.toPath());
         } catch (IOException e) {
-            throw new ToolException("Could not symlink output directory at: " + outputPath, e);
+            throw new ToolException("Could not symlink directory at: " + tableStorageDir, e);
         }
 
         return storageDir;
