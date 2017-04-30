@@ -6,6 +6,7 @@ import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.Session;
 import com.google.common.io.Files;
 import com.google.common.io.Resources;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.service.CassandraDaemon;
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.nodetool.CompactionStats;
@@ -14,15 +15,17 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.Charset;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 
 import static java.lang.String.format;
 
 public class CQLSSTableCompactionTool {
 
-    private static org.slf4j.Logger LOGGER = LoggerFactory.getLogger(CQLSSTableCompactionTool.class);
+    private static final org.slf4j.Logger LOGGER = LoggerFactory.getLogger(CQLSSTableCompactionTool.class);
 
     private static final int DEFAULT_JMX_PORT = 7199;
 
@@ -35,6 +38,11 @@ public class CQLSSTableCompactionTool {
                     "'replication_factor': '1' }" +
                     "AND DURABLE_WRITES = true;";
 
+    private static final String GET_TABLE_ID_CQL =
+            "SELECT id FROM system_schema.tables " +
+                    "WHERE keyspace_name = ? " +
+                    "AND table_name = ?";
+
     private final Options options;
 
     private CQLSSTableCompactionTool(Options options) {
@@ -42,26 +50,41 @@ public class CQLSSTableCompactionTool {
     }
 
     private void run() throws Exception {
-        configureLoggers();
+        if (System.getProperty("tool.verbose") == null) {
+            configureLoggers();
+        }
 
         try {
-            File storageDir = setUpDirectoryStructure();
+            File storageDir = createStorageDir();
 
             setUpDaemonProperties(storageDir);
 
-            LOGGER.info("Starting Cassandra...");
+            LOGGER.info("Starting Cassandra (you can ignore the ugly Sigar exception)");
 
             startDaemon();
 
-            LOGGER.info("Creating schema...");
+            LOGGER.info("Creating schema");
 
-            setUpSchema();
+            UUID tableId = setUpSchema();
 
-            LOGGER.info("Compacting...");
+            LOGGER.debug("created table '{}' with id={}", options.tableName, tableId);
+
+            LOGGER.info("Setting up table data");
+
+            Path stableStoragePath = setUpTableData(storageDir, tableId);
+
+            LOGGER.info("Compacting");
 
             compactAndStop();
 
+            LOGGER.info("Cleaning up");
+
+            cleanUp(storageDir, stableStoragePath);
+
             LOGGER.info("DONE");
+
+            System.exit(0);
+
         } catch (ToolException e) {
             System.err.println(e.getMessage());
             if (e.getCause() != null) {
@@ -69,6 +92,145 @@ public class CQLSSTableCompactionTool {
             }
             System.exit(1);
         }
+    }
+
+    private void cleanUp(File storageDir, Path stableStoragePath) throws IOException {
+        java.nio.file.Files.delete(stableStoragePath);
+
+        FileUtils.deleteRecursive(storageDir);
+    }
+
+    private File createStorageDir() {
+        return Files.createTempDir();
+    }
+
+    private void setUpDaemonProperties(File storageDir) {
+        File configFile = loadConfigFileIntoDir(storageDir);
+
+        System.setProperty("cassandra.config", configFile.toURI().toString());
+        System.setProperty("cassandra.storagedir", storageDir.getAbsolutePath());
+        System.setProperty("cassandra.jmx.local.port", String.valueOf(DEFAULT_JMX_PORT));
+    }
+
+    private void startDaemon() {
+        CassandraDaemon daemon = new CassandraDaemon(true);
+
+        daemon.applyConfig();
+
+        try {
+            daemon.init(null);
+        } catch (IOException e) {
+            throw new ToolException("Could not start Cassandra.", e);
+        }
+
+        daemon.start();
+    }
+
+    private UUID setUpSchema() {
+        try (Cluster cluster = Cluster.builder().addContactPoint("localhost").build();
+             Session session = cluster.connect()) {
+            LOGGER.debug("creating keyspace");
+            session.execute(format(CREATE_KEYSPACE_CQL, options.keyspaceName));
+
+            LOGGER.debug("creating table");
+            session.execute(options.tableDdl);
+
+            LOGGER.debug("getting table id");
+            return session.execute(GET_TABLE_ID_CQL, options.keyspaceName, options.tableName).one().getUUID("id");
+        }
+    }
+
+    private Path setUpTableData(File storageDir, UUID tableId) throws IOException {
+        String tableIdSuffix = tableId.toString().replaceAll("-", "");
+
+        String tableDirName = options.tableName + "-" + tableIdSuffix;
+
+        Path tableStoragePath = Paths.get(storageDir.getAbsolutePath(), "data", options.keyspaceName, tableDirName);
+
+        if (!tableStoragePath.toFile().exists()) {
+            throw new IllegalStateException("Table storage directory does not exist: " + tableStoragePath);
+        }
+
+        LOGGER.debug("deleting existing table storage dir: " + tableStoragePath);
+
+        FileUtils.deleteRecursive(tableStoragePath.toFile());
+
+        LOGGER.debug("creating symlink to input data");
+
+        try {
+            java.nio.file.Files.createSymbolicLink(tableStoragePath, options.inputDir.toPath());
+        } catch (IOException e) {
+            throw new ToolException("Could not symlink directory at: " + tableStoragePath, e);
+        }
+
+        LOGGER.debug("refreshing SSTables");
+
+        try (NodeProbe probe = connectProbe()) {
+            probe.loadNewSSTables(options.keyspaceName, options.tableName);
+        }
+
+        return tableStoragePath;
+    }
+
+    private void compactAndStop() throws IOException, ExecutionException, InterruptedException {
+        try (NodeProbe probe = connectProbe()) {
+            Thread compactionMonitor = startCompactionMonitor(probe);
+
+            LOGGER.debug("starting compaction");
+
+            probe.forceKeyspaceCompaction(false, options.keyspaceName, options.tableName);
+
+            LOGGER.debug("compaction completed");
+
+            compactionMonitor.interrupt();
+
+            LOGGER.debug("stopping daemon");
+
+            probe.stopCassandraDaemon();
+        }
+    }
+
+    private Thread startCompactionMonitor(NodeProbe probe) {
+        Thread compactionMonitor = new Thread(() -> {
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    CompactionStats.reportCompactionTable(
+                            probe.getCompactionManagerProxy().getCompactions(),
+                            probe.getCompactionThroughput(), true);
+
+                    Thread.sleep(COMPACTION_MONITOR_INTERVAL);
+                }
+            } catch (Exception e) {
+                // don't care
+            }
+        });
+
+        compactionMonitor.start();
+
+        return compactionMonitor;
+    }
+
+    private NodeProbe connectProbe() throws IOException {
+        return new NodeProbe("localhost", DEFAULT_JMX_PORT);
+    }
+
+    private File loadConfigFileIntoDir(File storageDir) {
+        LOGGER.debug("loading cassandra.yaml into: " + storageDir);
+
+        File configFile = new File(storageDir, "cassandra.yaml");
+
+        try {
+            Charset charset = Charsets.UTF_8;
+
+            String configContents =
+                    Resources.toString(Resources.getResource("cassandra.yaml"), charset);
+
+            Files.write(configContents, configFile, charset);
+        } catch (IOException e) {
+            throw new ToolException("Could not load cassandra.yaml from resources.");
+        }
+
+        return configFile;
     }
 
     private void configureLoggers() {
@@ -83,101 +245,6 @@ public class CQLSSTableCompactionTool {
 
         // TODO This one won't shut up.
         org.apache.log4j.Logger.getLogger("Sigar").setLevel(org.apache.log4j.Level.ERROR);
-    }
-
-    private File setUpDirectoryStructure() {
-        File storageDir = Files.createTempDir();
-
-        Path keyspaceStorageDir = Paths.get(storageDir.getAbsolutePath(), "data", options.keyspaceName);
-
-        if (!keyspaceStorageDir.toFile().mkdirs()) {
-            throw new ToolException("Could not create path: " + keyspaceStorageDir);
-        }
-
-        Path tableStorageDir = keyspaceStorageDir.resolve(options.tableName);
-
-        try {
-            java.nio.file.Files.createSymbolicLink(tableStorageDir, options.inputDir.toPath());
-        } catch (IOException e) {
-            throw new ToolException("Could not symlink directory at: " + tableStorageDir, e);
-        }
-
-        return storageDir;
-    }
-
-    private void startDaemon() {
-        CassandraDaemon daemon = new CassandraDaemon();
-
-        daemon.applyConfig();
-
-        try {
-            daemon.init(null);
-        } catch (IOException e) {
-            throw new ToolException("Could not start Cassandra.", e);
-        }
-
-        daemon.start();
-    }
-
-    private void setUpSchema() {
-        try (Cluster cluster = Cluster.builder().addContactPoint("localhost").build();
-             Session session = cluster.connect()) {
-            session.execute(format(CREATE_KEYSPACE_CQL, options.keyspaceName));
-
-            session.execute(options.tableDdl);
-        }
-    }
-
-    private void compactAndStop() throws IOException, ExecutionException, InterruptedException {
-        NodeProbe probe = new NodeProbe("localhost", DEFAULT_JMX_PORT);
-
-        Thread compactionMonitor = startCompactionMonitor(probe);
-
-        probe.forceKeyspaceCompaction(false, options.keyspaceName, options.tableName);
-
-        compactionMonitor.interrupt();
-
-        probe.stopCassandraDaemon();
-    }
-
-    private Thread startCompactionMonitor(NodeProbe probe) {
-        Thread compactionMonitor = new Thread(() -> {
-            try {
-                while (!Thread.currentThread().isInterrupted()) {
-                    CompactionStats.reportCompactionTable(probe.getCompactionManagerProxy().getCompactions(), probe.getCompactionThroughput(), true);
-
-                    Thread.sleep(COMPACTION_MONITOR_INTERVAL);
-                }
-            } catch (Exception e) {
-                // don't care
-            }
-        });
-
-        compactionMonitor.start();
-
-        return compactionMonitor;
-    }
-
-    private void setUpDaemonProperties(File storageDir) {
-        File configFile = loadConfigFileIntoDir(storageDir);
-
-        System.setProperty("cassandra.config", configFile.toURI().toString());
-        System.setProperty("cassandra.storagedir", storageDir.getAbsolutePath());
-        System.setProperty("cassandra.jmx.local.port", String.valueOf(DEFAULT_JMX_PORT));
-    }
-
-    private File loadConfigFileIntoDir(File storageDir) {
-        File configFile = new File(storageDir, "cassandra.yaml");
-
-        try {
-            String configContents = Resources.toString(Resources.getResource("cassandra.yaml"), Charsets.UTF_8);
-
-            Files.write(configContents, configFile, Charsets.UTF_8);
-        } catch (IOException e) {
-            throw new ToolException("Could not load cassandra.yaml from resources.");
-        }
-
-        return configFile;
     }
 
     public static void main(String[] args) throws Exception {
@@ -226,6 +293,7 @@ public class CQLSSTableCompactionTool {
         static String getUsage() {
             return "usage: {prog} KEYSPACE TABLE INPUT_DIR TABLE_DDL_FILE\n" +
                     "Properties:\n" +
+                    "  tool.verbose - Set to anything to have full output\n" +
                     "  java.io.tmpdir - Set the temp dir base";
         }
     }
