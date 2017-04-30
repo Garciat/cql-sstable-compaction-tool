@@ -79,7 +79,8 @@ public class CQLSSTableCompactionTool {
 
             LOGGER.info("Cleaning up");
 
-            cleanUp(storageDir, stableStoragePath);
+            // TODO: Some Cassandra threads expect the tree to be alive -- we can't delete it just yet.
+            // cleanUp(storageDir, stableStoragePath);
 
             LOGGER.info("DONE");
 
@@ -243,7 +244,7 @@ public class CQLSSTableCompactionTool {
         Logger datastaxDriverLogger = (Logger) LoggerFactory.getLogger("com.datastax.driver");
         datastaxDriverLogger.setLevel(Level.ERROR);
 
-        // TODO This one won't shut up.
+        // TODO: This one won't shut up.
         org.apache.log4j.Logger.getLogger("Sigar").setLevel(org.apache.log4j.Level.ERROR);
     }
 
