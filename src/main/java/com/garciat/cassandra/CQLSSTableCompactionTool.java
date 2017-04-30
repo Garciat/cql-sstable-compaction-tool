@@ -88,13 +88,13 @@ public class CQLSSTableCompactionTool {
     private File setUpDirectoryStructure() {
         File storageDir = Files.createTempDir();
 
-        Path keyspacePath = Paths.get(storageDir.getAbsolutePath(), "data", options.keyspaceName);
+        Path keyspaceStorageDir = Paths.get(storageDir.getAbsolutePath(), "data", options.keyspaceName);
 
-        if (!keyspacePath.toFile().mkdirs()) {
-            throw new ToolException("Could not create path: " + keyspacePath);
+        if (!keyspaceStorageDir.toFile().mkdirs()) {
+            throw new ToolException("Could not create path: " + keyspaceStorageDir);
         }
 
-        Path tableStorageDir = keyspacePath.resolve(options.tableName);
+        Path tableStorageDir = keyspaceStorageDir.resolve(options.tableName);
 
         try {
             java.nio.file.Files.createSymbolicLink(tableStorageDir, options.inputDir.toPath());
