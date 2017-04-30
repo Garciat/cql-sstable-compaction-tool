@@ -37,7 +37,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>com.nafora.reuters.migration.SSTableMigrationApp</mainClass>
+                            <mainClass>com.garciat.cassandra.CQLSSTableCompactionTool</mainClass>
                         </manifest>
                     </archive>
                     <descriptorRefs>
